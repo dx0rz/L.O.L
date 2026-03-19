@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import termios
 import tty
@@ -67,6 +68,181 @@ except ModuleNotFoundError:
 ALLOWED_POST_KEYS = {"login", "user", "email", "pass", "password"}
 USER_KEY_PATTERNS = ("user", "login", "email", "phone", "member", "id")
 PASS_KEY_PATTERNS = ("pass", "pwd", "password")
+
+
+def _can_use_sudo() -> bool:
+    return shutil.which("sudo") is not None
+
+
+def _is_root_user() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return False
+    return bool(geteuid() == 0)
+
+
+def _with_privilege(command: list[str]) -> list[str]:
+    if _is_root_user():
+        return command
+    if _can_use_sudo():
+        return ["sudo", *command]
+    return command
+
+
+def _detect_package_manager() -> str | None:
+    if shutil.which("apt"):
+        return "apt"
+    if shutil.which("dnf"):
+        return "dnf"
+    if shutil.which("pacman"):
+        return "pacman"
+    if shutil.which("brew"):
+        return "brew"
+    return None
+
+
+def _run_install_command(command: list[str]) -> bool:
+    try:
+        subprocess.run(command, check=True)
+        return True
+    except Exception:
+        return False
+
+
+def _install_python_dependencies(workspace_root: Path) -> bool:
+    requirements_file = workspace_root / "requirements.txt"
+    if not requirements_file.exists():
+        print(f"Missing requirements file: {requirements_file}")
+        return False
+
+    print("Installing missing Python dependencies...")
+    command = [sys.executable, "-m", "pip", "install", "-r", str(requirements_file)]
+    return _run_install_command(command)
+
+
+def _install_system_package(package_manager: str, package_name: str) -> bool:
+    if package_manager == "apt":
+        return _run_install_command(_with_privilege(["apt", "install", "-y", package_name]))
+    if package_manager == "dnf":
+        return _run_install_command(_with_privilege(["dnf", "install", "-y", package_name]))
+    if package_manager == "pacman":
+        return _run_install_command(_with_privilege(["pacman", "-S", "--noconfirm", package_name]))
+    if package_manager == "brew":
+        return _run_install_command(["brew", "install", package_name])
+    return False
+
+
+def _print_manual_install_help() -> None:
+    print("Could not auto-install all dependencies on this environment.")
+    print("Install manually and run again:")
+    print("  Python deps: python3 -m pip install -r requirements.txt")
+    print("  Ubuntu/Debian: sudo apt install -y php-cli cloudflared")
+    print("  Fedora/RHEL: sudo dnf install -y php-cli cloudflared")
+    print("  Arch: sudo pacman -S php cloudflared")
+    print("  macOS: brew install php cloudflared")
+
+
+def ensure_startup_requirements(workspace_root: Path) -> tuple[int, bool]:
+    """Ensure required dependencies are present before app startup.
+
+    Returns:
+        (exit_code, restart_required)
+    """
+    unique_missing = sorted(set(MISSING_DEPENDENCIES))
+    if unique_missing:
+        print(f"Missing Python dependencies detected: {', '.join(unique_missing)}")
+        if not _install_python_dependencies(workspace_root):
+            print("Failed to install Python dependencies automatically.")
+            return 1, False
+        print("Python dependencies installed. Restarting launcher...")
+        return 0, True
+
+    missing_required: list[str] = []
+    missing_optional: list[str] = []
+
+    if shutil.which("php") is None:
+        missing_required.append("php")
+    if shutil.which("cloudflared") is None:
+        missing_optional.append("cloudflared")
+
+    if not missing_required and not missing_optional:
+        return 0, False
+
+    package_manager = _detect_package_manager()
+    if package_manager is None:
+        if missing_required:
+            print(f"Missing required system dependency: {', '.join(missing_required)}")
+            _print_manual_install_help()
+            return 1, False
+        return 0, False
+
+    if missing_required:
+        print(f"Installing required system dependencies: {', '.join(missing_required)}")
+        for dep in missing_required:
+            package_name = "php-cli" if dep == "php" else dep
+            if not _install_system_package(package_manager, package_name):
+                print(f"Failed to auto-install required dependency: {dep}")
+                _print_manual_install_help()
+                return 1, False
+
+    if missing_optional:
+        print(f"Installing optional dependencies when available: {', '.join(missing_optional)}")
+        for dep in missing_optional:
+            if _install_system_package(package_manager, dep):
+                print(f"Installed optional dependency: {dep}")
+            else:
+                print(f"Optional dependency not installed: {dep} (continuing in local-only mode)")
+
+    return 0, False
+
+
+def _extract_missing_executable_name(exc: FileNotFoundError) -> str:
+    """Best-effort extraction of missing executable from FileNotFoundError."""
+    if getattr(exc, "filename", None):
+        return str(exc.filename)
+
+    msg = str(exc)
+    match = re.search(r"'([^']+)'", msg)
+    if match:
+        return match.group(1)
+    return "required executable"
+
+
+def print_missing_executable_help(console: Console | None, exc: FileNotFoundError) -> None:
+    """Render actionable install instructions for common missing binaries."""
+    executable = _extract_missing_executable_name(exc)
+    ui = console or (Console() if Console is not None else None)
+
+    if executable == "php":
+        message = (
+            "[bold red]Missing system dependency: php[/bold red]\n"
+            "L.O.L requires PHP CLI to serve templates.\n\n"
+            "Install it and run again:\n"
+            "  Ubuntu/Debian: [yellow]sudo apt update && sudo apt install -y php-cli[/yellow]\n"
+            "  Fedora/RHEL: [yellow]sudo dnf install -y php-cli[/yellow]\n"
+            "  Arch: [yellow]sudo pacman -S php[/yellow]\n"
+            "  macOS: [yellow]brew install php[/yellow]\n"
+            "  Windows: install PHP and ensure [yellow]php[/yellow] is in PATH"
+        )
+    elif executable == "cloudflared":
+        message = (
+            "[bold red]Missing optional dependency: cloudflared[/bold red]\n"
+            "Public tunnel mode will be disabled; local mode still works.\n\n"
+            "Install cloudflared to enable public URLs:\n"
+            "  Ubuntu/Debian: [yellow]sudo apt install -y cloudflared[/yellow]\n"
+            "  macOS: [yellow]brew install cloudflared[/yellow]\n"
+            "  Official: [yellow]https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/[/yellow]"
+        )
+    else:
+        message = (
+            f"[bold red]Missing dependency: {executable}[/bold red]\n"
+            "Install the required executable and ensure it is available in PATH."
+        )
+
+    if ui is not None:
+        ui.print(message)
+    else:
+        print(re.sub(r"\[[^\]]+\]", "", message))
 
 
 def utc_now_iso() -> str:
@@ -1167,14 +1343,21 @@ def build_config(args: argparse.Namespace) -> AppConfig:
 
 
 async def async_main() -> int:
+    args = parse_args()
+
+    startup_root = Path(args.project_root).resolve()
+    startup_check_code, restart_required = ensure_startup_requirements(startup_root)
+    if startup_check_code != 0:
+        return startup_check_code
+    if restart_required:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
     dependency_check = validate_dependencies()
     if dependency_check != 0:
         return dependency_check
 
-    args = parse_args()
-
     console = Console() if Console is not None else None
-    workspace_root = Path(args.project_root).resolve()
+    workspace_root = startup_root
     auth_dir = (workspace_root / "auth").resolve()
     sites_dir = (workspace_root / args.sites_dir).resolve()
     runtime_webroot = (workspace_root / ".lol_runtime" / "www").resolve()
@@ -1230,8 +1413,7 @@ async def async_main() -> int:
         server = LocalWebTestingServer(config)
         await server.run()
     except FileNotFoundError as exc:
-        missing = str(exc).strip() or "required executable"
-        Console().print(f"[magenta]Missing dependency: {missing}[/magenta]")
+        print_missing_executable_help(console, exc)
         return 1
     except ValueError as exc:
         Console().print(f"[magenta]Configuration error: {exc}[/magenta]")
