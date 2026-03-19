@@ -1,0 +1,25 @@
+# Git metadata and editor files
+
+.git
+.vscode
+
+# Python caches and virtual environments
+
+**pycache**
+_.py[cod]
+_.pyo
+\*.pyd
+.venv
+venv
+env
+
+# Runtime/generated data
+
+.lol_runtime
+traffic_log.json
+auth
+
+# OS noise
+
+.DS_Store
+Thumbs.db
